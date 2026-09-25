@@ -580,6 +580,9 @@ fn ensure_patches_applied(config: &Config) -> io::Result<()> {
     println!("cargo:warning=applying reality patch to boringssl");
     apply_patch(config, "reality.patch")?;
 
+    println!("cargo:warning=applying fingerprint patch to boringssl");
+    apply_patch(config, "fingerprint.patch")?;
+
     if config.features.underscore_wildcards {
         println!("cargo:warning=applying underscore wildcards patch to boringssl");
         apply_patch(config, "underscore-wildcards.patch")?;

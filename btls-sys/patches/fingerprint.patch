@@ -1,0 +1,98 @@
+diff --git a/include/openssl/ssl.h b/include/openssl/ssl.h
+index d54a874..0b804ba 100644
+--- a/include/openssl/ssl.h
++++ b/include/openssl/ssl.h
+@@ -2971,6 +2971,18 @@ typedef int (*SSL_client_hello_finalize_cb_func)(
+     const uint8_t client_random[32], const uint8_t x25519_private_key[32],
+     uint8_t out_session_id[32]);
+ 
++// SSL_set_ech_grease_shape fixes the ECH GREASE extension that |ssl| sends
++// (see |SSL_set_enable_ech_grease|): |aead_id| is the HPKE AEAD it names and
++// |payload_len| the length of its payload. Zero for either keeps BoringSSL's
++// choice: AES-128-GCM with AES hardware, otherwise ChaCha20-Poly1305, and a
++// random length. It returns one on success and zero if |aead_id| is not a
++// supported HPKE AEAD.
++//
++// A client imitating another's ClientHello can use it to send the same ECH
++// GREASE.
++OPENSSL_EXPORT int SSL_set_ech_grease_shape(SSL *ssl, uint16_t aead_id,
++                                            size_t payload_len);
++
+ // SSL_set_client_hello_finalize_cb sets |cb| on |ssl|. With it set, the
+ // handshake fails unless the ClientHello carries a 32-byte session ID (TLS 1.3
+ // compatibility mode) and an X25519 or X25519MLKEM768 key share. It does not
+diff --git a/ssl/encrypted_client_hello.cc b/ssl/encrypted_client_hello.cc
+index 46ba196..c936cc4 100644
+--- a/ssl/encrypted_client_hello.cc
++++ b/ssl/encrypted_client_hello.cc
+@@ -741,6 +741,17 @@ static bool setup_ech_grease(SSL_HANDSHAKE *hs) {
+                               : EVP_has_aes_hardware();
+   const EVP_HPKE_AEAD *aead =
+       has_aes_hw ? EVP_hpke_aes_128_gcm() : EVP_hpke_chacha20_poly1305();
++  switch (hs->config->ech_grease_aead_id) {
++    case EVP_HPKE_AES_128_GCM:
++      aead = EVP_hpke_aes_128_gcm();
++      break;
++    case EVP_HPKE_AES_256_GCM:
++      aead = EVP_hpke_aes_256_gcm();
++      break;
++    case EVP_HPKE_CHACHA20_POLY1305:
++      aead = EVP_hpke_chacha20_poly1305();
++      break;
++  }
+   static_assert(ssl_grease_ech_config_id < sizeof(hs->grease_seed),
+                 "hs->grease_seed is too small");
+   uint8_t config_id = hs->grease_seed[ssl_grease_ech_config_id];
+@@ -765,7 +776,9 @@ static bool setup_ech_grease(SSL_HANDSHAKE *hs) {
+   // estimate maximum_name_length to be between 32 and 100 bytes. Then round up
+   // to a multiple of 32, to match RFC 9849, section 6.1.3.
+   const size_t payload_len =
+-      32 * random_size(128 / 32, 224 / 32) + aead_overhead(aead);
++      hs->config->ech_grease_payload_len != 0
++          ? hs->config->ech_grease_payload_len
++          : 32 * random_size(128 / 32, 224 / 32) + aead_overhead(aead);
+   bssl::ScopedCBB cbb;
+   CBB enc_cbb, payload_cbb;
+   uint8_t *payload;
+diff --git a/ssl/internal.h b/ssl/internal.h
+index c39beab..cea2c96 100644
+--- a/ssl/internal.h
++++ b/ssl/internal.h
+@@ -3427,6 +3427,10 @@ struct SSL_CONFIG {
+ 
+   // Client-only: see |SSL_set_client_hello_finalize_cb|.
+   SSL_client_hello_finalize_cb_func client_hello_finalize_cb = nullptr;
++
++  // Client-only: see |SSL_set_ech_grease_shape|. Zero keeps the default.
++  uint16_t ech_grease_aead_id = 0;
++  size_t ech_grease_payload_len = 0;
+   // Server-only: psk_identity_hint is the identity hint to send in
+   // PSK-based key exchanges.
+   UniquePtr<char> psk_identity_hint;
+diff --git a/ssl/ssl_lib.cc b/ssl/ssl_lib.cc
+index b7c9eed..80a64fd 100644
+--- a/ssl/ssl_lib.cc
++++ b/ssl/ssl_lib.cc
+@@ -2327,6 +2327,22 @@ void SSL_set_custom_verify(
+   ssl_impl->config->custom_verify_callback = callback;
+ }
+ 
++int SSL_set_ech_grease_shape(SSL *ssl, uint16_t aead_id, size_t payload_len) {
++  auto *ssl_impl = FromOpaque(ssl);
++  if (!ssl_impl->config) {
++    return 0;
++  }
++  if (aead_id != 0 && aead_id != EVP_HPKE_AES_128_GCM &&
++      aead_id != EVP_HPKE_AES_256_GCM &&
++      aead_id != EVP_HPKE_CHACHA20_POLY1305) {
++    OPENSSL_PUT_ERROR(SSL, SSL_R_UNSUPPORTED_ECH_SERVER_CONFIG);
++    return 0;
++  }
++  ssl_impl->config->ech_grease_aead_id = aead_id;
++  ssl_impl->config->ech_grease_payload_len = payload_len;
++  return 1;
++}
++
+ void SSL_set_client_hello_finalize_cb(SSL *ssl,
+                                       SSL_client_hello_finalize_cb_func cb) {
+   auto *ssl_impl = FromOpaque(ssl);
