@@ -1,0 +1,179 @@
+diff --git a/include/openssl/ssl.h b/include/openssl/ssl.h
+index dd81949..8a0300a 100644
+--- a/include/openssl/ssl.h
++++ b/include/openssl/ssl.h
+@@ -2851,6 +2851,29 @@ OPENSSL_EXPORT void SSL_set_custom_verify(
+     SSL *ssl, int mode,
+     enum ssl_verify_result_t (*callback)(SSL *ssl, uint8_t *out_alert));
+ 
++// SSL_client_hello_finalize_cb_func is called on a client for the first
++// ClientHello of a connection, after it is encoded and before it is added to
++// the transcript and sent. |hello| is the ClientHello message, with its
++// four-byte header and with its 32-byte legacy_session_id zeroed.
++// |x25519_private_key| is the private key of the X25519 key share: the
++// standalone X25519 share if one is offered, else the X25519 half of the
++// X25519MLKEM768 share. The callback writes the legacy_session_id to send to
++// |out_session_id| and returns one, or returns zero to fail the handshake.
++//
++// Protocols that authenticate the client in the session ID, such as REALITY,
++// use it.
++typedef int (*SSL_client_hello_finalize_cb_func)(
++    SSL *ssl, const uint8_t *hello, size_t hello_len,
++    const uint8_t client_random[32], const uint8_t x25519_private_key[32],
++    uint8_t out_session_id[32]);
++
++// SSL_set_client_hello_finalize_cb sets |cb| on |ssl|. With it set, the
++// handshake fails unless the ClientHello carries a 32-byte session ID (TLS 1.3
++// compatibility mode) and an X25519 or X25519MLKEM768 key share. It does not
++// apply to DTLS, QUIC or ECH.
++OPENSSL_EXPORT void SSL_set_client_hello_finalize_cb(
++    SSL *ssl, SSL_client_hello_finalize_cb_func cb);
++
+ // SSL_CTX_get_verify_mode returns |ctx|'s verify mode, set by
+ // |SSL_CTX_set_verify|.
+ OPENSSL_EXPORT int SSL_CTX_get_verify_mode(const SSL_CTX *ctx);
+diff --git a/ssl/handshake_client.cc b/ssl/handshake_client.cc
+index 378bc70..e20acbc 100644
+--- a/ssl/handshake_client.cc
++++ b/ssl/handshake_client.cc
+@@ -230,6 +230,57 @@ bool ssl_write_client_hello_without_extensions(const SSL_HANDSHAKE *hs,
+   return true;
+ }
+ 
++// finalize_client_hello runs the |SSL_set_client_hello_finalize_cb| callback
++// on the first ClientHello |msg|, and puts the session ID it returns in |msg|
++// and |hs|, so the ServerHello's echo of it matches.
++static bool finalize_client_hello(SSL_HANDSHAKE *hs, ssl_client_hello_type_t type,
++                                  Span<uint8_t> msg) {
++  SSL *const ssl = hs->ssl;
++  SSL_client_hello_finalize_cb_func cb = hs->config->client_hello_finalize_cb;
++  if (cb == nullptr || ssl->s3->used_hello_retry_request) {
++    return true;
++  }
++  // The session ID follows the four-byte header, the version and the random.
++  constexpr size_t kSessionIDOffset = 4 + 2 + SSL3_RANDOM_SIZE + 1;
++  if (SSL_is_dtls(ssl) || SSL_is_quic(ssl) || type != ssl_client_hello_unencrypted ||
++      hs->session_id.size() != SSL3_SESSION_ID_SIZE ||
++      msg.size() < kSessionIDOffset + SSL3_SESSION_ID_SIZE ||
++      msg[kSessionIDOffset - 1] != SSL3_SESSION_ID_SIZE) {
++    OPENSSL_PUT_ERROR(SSL, SSL_R_HANDSHAKE_FAILURE_ON_CLIENT_HELLO);
++    return false;
++  }
++
++  // A standalone X25519 share first, as a server that finds one uses it.
++  uint8_t x25519_private_key[32];
++  bool found = false;
++  for (uint16_t group : {SSL_GROUP_X25519, SSL_GROUP_X25519_MLKEM768}) {
++    for (const auto &key_share : hs->key_shares) {
++      if (!found && key_share->GroupID() == group &&
++          key_share->X25519PrivateKey(x25519_private_key)) {
++        found = true;
++      }
++    }
++  }
++  if (!found) {
++    OPENSSL_PUT_ERROR(SSL, SSL_R_MISSING_KEY_SHARE);
++    return false;
++  }
++
++  Span<uint8_t> session_id = msg.subspan(kSessionIDOffset, SSL3_SESSION_ID_SIZE);
++  OPENSSL_memset(session_id.data(), 0, session_id.size());
++  uint8_t new_session_id[SSL3_SESSION_ID_SIZE];
++  int ok = cb(ssl, msg.data(), msg.size(), ssl->s3->client_random,
++              x25519_private_key, new_session_id);
++  OPENSSL_cleanse(x25519_private_key, sizeof(x25519_private_key));
++  if (!ok) {
++    OPENSSL_PUT_ERROR(SSL, SSL_R_HANDSHAKE_FAILURE_ON_CLIENT_HELLO);
++    return false;
++  }
++  OPENSSL_memcpy(session_id.data(), new_session_id, sizeof(new_session_id));
++  hs->session_id.CopyFrom(new_session_id);
++  return true;
++}
++
+ bool ssl_add_client_hello(SSL_HANDSHAKE *hs) {
+   SSL *const ssl = hs->ssl;
+   ScopedCBB cbb;
+@@ -244,7 +295,8 @@ bool ssl_add_client_hello(SSL_HANDSHAKE *hs) {
+                                                  /*empty_session_id=*/false) ||
+       !ssl_add_clienthello_tlsext(hs, &body, /*out_encoded=*/nullptr,
+                                   &needs_psk_binder, type, CBB_len(&body)) ||
+-      !ssl->method->finish_message(ssl, cbb.get(), &msg)) {
++      !ssl->method->finish_message(ssl, cbb.get(), &msg) ||
++      !finalize_client_hello(hs, type, Span(msg))) {
+     return false;
+   }
+ 
+diff --git a/ssl/internal.h b/ssl/internal.h
+index c80e565..0e85443 100644
+--- a/ssl/internal.h
++++ b/ssl/internal.h
+@@ -951,6 +951,11 @@ class SSLKeyShare {
+   // DeserializePrivateKey initializes the state of the key exchange from |in|,
+   // returning true if successful and false otherwise.
+   virtual bool DeserializePrivateKey(CBS *in) { return false; }
++
++  // X25519PrivateKey writes the private key of the share's X25519 part to
++  // |out| and returns true, or returns false if the share has none. It should
++  // be called after |Generate|.
++  virtual bool X25519PrivateKey(uint8_t out[32]) const { return false; }
+ };
+ 
+ struct NamedGroup {
+@@ -3277,6 +3282,9 @@ struct SSL_CONFIG {
+ 
+   enum ssl_verify_result_t (*custom_verify_callback)(
+       SSL *ssl, uint8_t *out_alert) = nullptr;
++
++  // Client-only: see |SSL_set_client_hello_finalize_cb|.
++  SSL_client_hello_finalize_cb_func client_hello_finalize_cb = nullptr;
+   // Server-only: psk_identity_hint is the identity hint to send in
+   // PSK-based key exchanges.
+   UniquePtr<char> psk_identity_hint;
+diff --git a/ssl/ssl_key_share.cc b/ssl/ssl_key_share.cc
+index 94d83ee..c9eca93 100644
+--- a/ssl/ssl_key_share.cc
++++ b/ssl/ssl_key_share.cc
+@@ -181,6 +181,11 @@ class X25519KeyShare : public SSLKeyShare {
+     return CBB_add_bytes(out, private_key_, sizeof(private_key_));
+   }
+ 
++  bool X25519PrivateKey(uint8_t out[32]) const override {
++    OPENSSL_memcpy(out, private_key_, sizeof(private_key_));
++    return true;
++  }
++
+   bool DeserializePrivateKey(CBS *in) override {
+     if (CBS_len(in) != sizeof(private_key_) ||
+         !CBS_copy_bytes(in, private_key_, sizeof(private_key_))) {
+@@ -473,6 +478,11 @@ class X25519MLKEM768KeyShare : public SSLKeyShare {
+     return true;
+   }
+ 
++  bool X25519PrivateKey(uint8_t out[32]) const override {
++    OPENSSL_memcpy(out, x25519_private_key_, sizeof(x25519_private_key_));
++    return true;
++  }
++
+  private:
+   uint8_t x25519_private_key_[32];
+   MLKEM768_private_key mlkem_private_key_;
+diff --git a/ssl/ssl_lib.cc b/ssl/ssl_lib.cc
+index f2e3a70..c739f09 100644
+--- a/ssl/ssl_lib.cc
++++ b/ssl/ssl_lib.cc
+@@ -2175,6 +2175,14 @@ void SSL_set_custom_verify(
+   ssl->config->custom_verify_callback = callback;
+ }
+ 
++void SSL_set_client_hello_finalize_cb(SSL *ssl,
++                                      SSL_client_hello_finalize_cb_func cb) {
++  if (!ssl->config) {
++    return;
++  }
++  ssl->config->client_hello_finalize_cb = cb;
++}
++
+ void SSL_CTX_enable_signed_cert_timestamps(SSL_CTX *ctx) {
+   ctx->signed_cert_timestamps_enabled = true;
+ }
