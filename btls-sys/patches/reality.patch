@@ -1,5 +1,5 @@
 diff --git a/include/openssl/ssl.h b/include/openssl/ssl.h
-index dd81949..8a0300a 100644
+index dd81949..ff27316 100644
 --- a/include/openssl/ssl.h
 +++ b/include/openssl/ssl.h
 @@ -2851,6 +2851,29 @@ OPENSSL_EXPORT void SSL_set_custom_verify(
@@ -32,6 +32,39 @@ index dd81949..8a0300a 100644
  // SSL_CTX_get_verify_mode returns |ctx|'s verify mode, set by
  // |SSL_CTX_set_verify|.
  OPENSSL_EXPORT int SSL_CTX_get_verify_mode(const SSL_CTX *ctx);
+@@ -3071,6 +3094,17 @@ OPENSSL_EXPORT int SSL_set_verify_algorithm_prefs(SSL *ssl,
+                                                   const uint16_t *prefs,
+                                                   size_t num_prefs);
+ 
++// SSL_set_extra_peer_verify_algorithms sets signature algorithms that |ssl|
++// accepts from the peer in addition to the ones it advertises (see
++// |SSL_set_verify_algorithm_prefs|), without advertising them. It returns one
++// on success and zero on error.
++//
++// A client imitating another's ClientHello can use it to accept a signature
++// algorithm that the imitated ClientHello does not list.
++OPENSSL_EXPORT int SSL_set_extra_peer_verify_algorithms(SSL *ssl,
++                                                        const uint16_t *prefs,
++                                                        size_t num_prefs);
++
+ 
+ // Certificate authorities.
+ //
+diff --git a/ssl/extensions.cc b/ssl/extensions.cc
+index f460204..f9333e1 100644
+--- a/ssl/extensions.cc
++++ b/ssl/extensions.cc
+@@ -327,7 +327,9 @@ bool tls12_check_peer_sigalg(const SSL_HANDSHAKE *hs, uint8_t *out_alert,
+   // The peer must have selected an algorithm that is consistent with its public
+   // key, the TLS version, and what we advertised.
+   Span<const uint16_t> sigalgs = tls12_get_verify_sigalgs(hs);
+-  if (std::find(sigalgs.begin(), sigalgs.end(), sigalg) == sigalgs.end() ||
++  Span<const uint16_t> extra = hs->config->extra_peer_verify_sigalgs;
++  if ((std::find(sigalgs.begin(), sigalgs.end(), sigalg) == sigalgs.end() &&
++       std::find(extra.begin(), extra.end(), sigalg) == extra.end()) ||
+       !ssl_pkey_supports_algorithm(hs->ssl, pkey, sigalg, /*is_verify=*/true)) {
+     OPENSSL_PUT_ERROR(SSL, SSL_R_WRONG_SIGNATURE_TYPE);
+     *out_alert = SSL_AD_ILLEGAL_PARAMETER;
 diff --git a/ssl/handshake_client.cc b/ssl/handshake_client.cc
 index 378bc70..e20acbc 100644
 --- a/ssl/handshake_client.cc
@@ -105,7 +138,7 @@ index 378bc70..e20acbc 100644
    }
  
 diff --git a/ssl/internal.h b/ssl/internal.h
-index c80e565..0e85443 100644
+index c80e565..69cd888 100644
 --- a/ssl/internal.h
 +++ b/ssl/internal.h
 @@ -951,6 +951,11 @@ class SSLKeyShare {
@@ -130,6 +163,17 @@ index c80e565..0e85443 100644
    // Server-only: psk_identity_hint is the identity hint to send in
    // PSK-based key exchanges.
    UniquePtr<char> psk_identity_hint;
+@@ -3344,6 +3352,10 @@ struct SSL_CONFIG {
+   // accepted from the peer in decreasing order of preference.
+   Array<uint16_t> verify_sigalgs;
+ 
++  // extra_peer_verify_sigalgs are accepted from the peer on top of the
++  // advertised ones. See |SSL_set_extra_peer_verify_algorithms|.
++  Array<uint16_t> extra_peer_verify_sigalgs;
++
+   // srtp_profiles is the list of configured SRTP protection profiles for
+   // DTLS-SRTP.
+   UniquePtr<STACK_OF(SRTP_PROTECTION_PROFILE)> srtp_profiles;
 diff --git a/ssl/ssl_key_share.cc b/ssl/ssl_key_share.cc
 index 94d83ee..c9eca93 100644
 --- a/ssl/ssl_key_share.cc
@@ -177,3 +221,25 @@ index f2e3a70..c739f09 100644
  void SSL_CTX_enable_signed_cert_timestamps(SSL_CTX *ctx) {
    ctx->signed_cert_timestamps_enabled = true;
  }
+diff --git a/ssl/ssl_privkey.cc b/ssl/ssl_privkey.cc
+index 926d2c0..5606ad1 100644
+--- a/ssl/ssl_privkey.cc
++++ b/ssl/ssl_privkey.cc
+@@ -920,6 +920,17 @@ int SSL_set_verify_algorithm_prefs(SSL *ssl, const uint16_t *prefs,
+   return set_sigalg_prefs(&ssl->config->verify_sigalgs, Span(prefs, num_prefs));
+ }
+ 
++int SSL_set_extra_peer_verify_algorithms(SSL *ssl, const uint16_t *prefs,
++                                         size_t num_prefs) {
++  if (!ssl->config) {
++    OPENSSL_PUT_ERROR(SSL, ERR_R_SHOULD_NOT_HAVE_BEEN_CALLED);
++    return 0;
++  }
++
++  return set_sigalg_prefs(&ssl->config->extra_peer_verify_sigalgs,
++                          Span(prefs, num_prefs));
++}
++
+ int SSL_CTX_set_delegated_credentials(SSL_CTX *ctx, const char *str) {
+    if (!ctx) {
+     OPENSSL_PUT_ERROR(SSL, ERR_R_SHOULD_NOT_HAVE_BEEN_CALLED);
