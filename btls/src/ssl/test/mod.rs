@@ -33,6 +33,7 @@ mod patch_ciphers;
 mod patches;
 mod private_key_method;
 mod server;
+mod server_padding;
 mod session;
 mod session_resumption;
 mod trust_anchors;
@@ -326,6 +327,54 @@ fn test_alpn_server_select_none() {
     client.ctx().set_alpn_protos(b"\x06http/2").unwrap();
     let s = client.connect();
     assert_eq!(None, s.ssl().selected_alpn_protocol());
+}
+
+#[test]
+fn application_settings() {
+    const SETTINGS: &[u8] = b"\x00\x03\x00\x00\x00\x64";
+
+    /// Returns the ALPS values the client and the server received; `server` is `None` when the
+    /// server does not enable ALPS.
+    fn handshake(
+        client: Option<&'static [u8]>,
+        server: Option<Option<&'static [u8]>>,
+    ) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut builder = Server::builder();
+        builder.ctx().set_alpn_select_callback(|_, client| {
+            ssl::select_next_proto(b"\x02h2", client).ok_or(ssl::AlpnError::NOACK)
+        });
+        builder.ssl_cb(move |ssl| {
+            if let Some(settings) = server {
+                ssl.add_application_settings(b"h2", settings).unwrap();
+            }
+        });
+        builder.io_cb(move |s| {
+            let received = s.ssl().peer_application_settings().map(ToOwned::to_owned);
+            tx.send(received).unwrap();
+        });
+        let server = builder.build();
+
+        let mut builder = server.client().build().builder();
+        builder.ssl().set_alpn_protos(b"\x02h2").unwrap();
+        builder
+            .ssl()
+            .add_application_settings(b"h2", client)
+            .unwrap();
+        let s = builder.connect();
+        let client = s.ssl().peer_application_settings().map(ToOwned::to_owned);
+        (client, rx.recv().unwrap())
+    }
+
+    let some = Some(SETTINGS.to_vec());
+    let empty = Some(Vec::new());
+    assert_eq!(
+        handshake(Some(SETTINGS), Some(Some(SETTINGS))),
+        (some.clone(), some.clone())
+    );
+    assert_eq!(handshake(None, Some(Some(SETTINGS))), (some, empty.clone()));
+    assert_eq!(handshake(Some(b""), Some(None)), (empty.clone(), empty));
+    assert_eq!(handshake(Some(SETTINGS), None), (None, None));
 }
 
 #[test]
