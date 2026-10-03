@@ -30,8 +30,11 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  # Built from this commit's btls-sys rather than the one sail pins.
-  PATCH: patch."https://github.com/peakpassvpn/btls.git".btls-sys.path="../btls/btls-sys"
+  # Built from this commit's btls and btls-sys rather than those sail
+  # pins: both, as btls's own btls-sys is the one beside it, and only one
+  # package may link the library.
+  PATCH_SYS: patch."https://github.com/peakpassvpn/btls.git".btls-sys.path="../btls/btls-sys"
+  PATCH_BTLS: patch."https://github.com/peakpassvpn/btls.git".btls.path="../btls/btls"
 
 jobs:
   build:
@@ -101,9 +104,9 @@ jobs:
           mkdir -p "$out"
           export BORING_BSSL_INSTALL_DIR="$out"
           if [ "${{ matrix.cross }}" = true ]; then
-            scripts/cross.sh ${{ matrix.target }} build --release -p btls-sys --config "$PATCH"
+            scripts/cross.sh ${{ matrix.target }} build --release -p btls-sys --config "$PATCH_SYS" --config "$PATCH_BTLS"
           else
-            cargo build --release -p btls-sys --target ${{ matrix.target }} --config "$PATCH"
+            cargo build --release -p btls-sys --target ${{ matrix.target }} --config "$PATCH_SYS" --config "$PATCH_BTLS"
           fi
           # Built from this commit's btls-sys, not the one sail pins.
           if grep -A2 'name = "btls-sys"' Cargo.lock | grep -q '^source = '; then
