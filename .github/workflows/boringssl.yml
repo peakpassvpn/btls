@@ -1,0 +1,185 @@
+name: boringssl
+
+# BoringSSL as this fork patches it, compiled once per commit and target,
+# so that a project building sail (or btls) from source need not compile
+# it again: the release `bssl-<commit>` of the commit dispatched on holds
+# `boringssl-<target>.tar.gz` (lib/ with the static libraries, include/,
+# BUILDINFO), SHA256SUMS and build attestations. FORK.md says how a
+# consumer takes them, and what its build must match.
+#
+# Each target is built as sail builds it: in a checkout of sail, its
+# btls-sys patched to this commit's, with sail's toolchain and its cross
+# scripts, by btls-sys itself (BORING_BSSL_INSTALL_DIR), in release.
+on:
+  # A ci/ branch builds every target without publishing, to try a change
+  # before it is on the default branch, where dispatch needs the file.
+  push:
+    branches: ["ci/**"]
+  workflow_dispatch:
+    inputs:
+      sail_ref:
+        description: sail's ref whose toolchain and cross scripts build it
+        default: master
+      publish:
+        description: publish the release bssl-<commit>; otherwise artifacts only
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # Built from this commit's btls-sys rather than the one sail pins.
+  PATCH: patch."https://github.com/peakpassvpn/btls.git".btls-sys.path="../btls/btls-sys"
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Native builds. Linux on 22.04: glibc 2.35 is the baseline.
+          - { target: x86_64-unknown-linux-gnu, os: ubuntu-22.04 }
+          - { target: aarch64-unknown-linux-gnu, os: ubuntu-22.04-arm }
+          - { target: x86_64-pc-windows-msvc, os: windows-latest }
+          - { target: aarch64-apple-darwin, os: macos-latest }
+          - { target: x86_64-apple-darwin, os: macos-latest }
+          # Through sail's cross toolchains.
+          - { target: x86_64-unknown-linux-musl, os: ubuntu-latest, cross: true }
+          - { target: aarch64-unknown-linux-musl, os: ubuntu-latest, cross: true }
+          - { target: i686-unknown-linux-musl, os: ubuntu-latest, cross: true }
+          - { target: armv7-unknown-linux-musleabihf, os: ubuntu-latest, cross: true }
+          - { target: arm-unknown-linux-musleabi, os: ubuntu-latest, cross: true }
+          - { target: aarch64-linux-android, os: ubuntu-latest, cross: true }
+          - { target: armv7-linux-androideabi, os: ubuntu-latest, cross: true }
+          - { target: x86_64-linux-android, os: ubuntu-latest, cross: true }
+          - { target: i686-linux-android, os: ubuntu-latest, cross: true }
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    env:
+      # As sail's release builds Apple's (scripts/release/build-apple.sh).
+      MACOSX_DEPLOYMENT_TARGET: "13.0"
+    steps:
+      - name: LF checkout
+        run: git config --global core.autocrlf false
+
+      - name: checkout btls
+        uses: actions/checkout@v4
+        with:
+          path: btls
+          submodules: true
+
+      - name: checkout sail
+        uses: actions/checkout@v4
+        with:
+          repository: peakpassvpn/sail
+          ref: ${{ inputs.sail_ref || 'master' }}
+          path: sail
+
+      - name: install rust toolchain
+        working-directory: sail
+        run: rustup show active-toolchain && rustup target add ${{ matrix.target }}
+
+      - name: install cross toolchain
+        if: ${{ matrix.cross }}
+        working-directory: sail
+        run: scripts/install_cross_toolchain.sh ${{ matrix.target }}
+
+      # bindgen's libclang, from the runner's LLVM.
+      - name: libclang (Windows)
+        if: ${{ runner.os == 'Windows' }}
+        run: printf '%s\n' 'LIBCLANG_PATH=C:\Program Files\LLVM\bin' >>"$GITHUB_ENV"
+
+      - name: build
+        working-directory: sail
+        run: |
+          out="$GITHUB_WORKSPACE/out/${{ matrix.target }}"
+          mkdir -p "$out"
+          export BORING_BSSL_INSTALL_DIR="$out"
+          if [ "${{ matrix.cross }}" = true ]; then
+            scripts/cross.sh ${{ matrix.target }} build --release -p btls-sys --config "$PATCH"
+          else
+            cargo build --release -p btls-sys --target ${{ matrix.target }} --config "$PATCH"
+          fi
+          # Built from this commit's btls-sys, not the one sail pins.
+          if grep -A2 'name = "btls-sys"' Cargo.lock | grep -q '^source = '; then
+            echo "::error::btls-sys came from sail's pin, not this commit"; exit 1
+          fi
+
+      # Windows: BoringSSL's assembly, or none (NASM not found).
+      - name: has its assembly (Windows)
+        if: ${{ runner.os == 'Windows' }}
+        working-directory: sail
+        run: |
+          cache=$(find target/${{ matrix.target }}/release/build -path '*btls-sys-*/out/build/CMakeCache.txt' | head -1)
+          if grep -qE '^OPENSSL_NO_ASM:[A-Z]+=(1|ON|YES|TRUE)' "$cache"; then exit 1; fi
+          grep -qE '^CMAKE_ASM_NASM_COMPILER:[A-Z]+=.+' "$cache"
+
+      - name: package
+        run: |
+          out="out/${{ matrix.target }}"
+          {
+            echo "btls: ${{ github.sha }}"
+            echo "target: ${{ matrix.target }}"
+            echo "sail: $(git -C sail rev-parse HEAD)"
+            echo "runner: ${{ matrix.os }} ($ImageOS $ImageVersion)"
+            echo "rustc: $(cd sail && rustc -V)"
+            echo "cmake: $(cmake --version | head -1)"
+            case "${{ matrix.target }}" in
+              *-msvc) echo "crt: dynamic (/MD)" ;;
+              *-apple-darwin) echo "macos deployment target: $MACOSX_DEPLOYMENT_TARGET" ;;
+              *-linux-gnu) echo "glibc: $(ldd --version | head -1)" ;;
+              i686-*) echo "cflags: -msse2" ;;
+            esac
+          } >"$out/BUILDINFO"
+          mkdir -p dist
+          tar -czf "dist/boringssl-${{ matrix.target }}.tar.gz" -C "$out" lib include BUILDINFO
+          ls -l dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: boringssl-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    needs: build
+    if: ${{ inputs.publish }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: checksums
+        working-directory: dist
+        run: sha256sum boringssl-*.tar.gz >SHA256SUMS && cat SHA256SUMS
+
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: dist/*
+
+      # One release per commit, never replaced: a consumer that checked a
+      # file's hash once can rely on it.
+      - name: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="bssl-${{ github.sha }}"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::error::$tag exists already; its files are not replaced"
+            exit 1
+          fi
+          gh release create "$tag" --repo "$GITHUB_REPOSITORY" --target "${{ github.sha }}" \
+            --title "BoringSSL for btls ${{ github.sha }}" --latest=false \
+            --notes "BoringSSL as btls ${{ github.sha }} patches it, built per target. How to use it: FORK.md." \
+            dist/*
