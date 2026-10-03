@@ -64,6 +64,10 @@ if [ ! -f "$dir/BUILDINFO" ]; then
 	mv "$dir.tmp" "$dir"
 fi
 
+# Git Bash on Windows: a path cargo, a Windows program, reads (D:/x).
+if command -v cygpath >/dev/null; then
+	dir=$(cygpath -m "$dir")
+fi
 t=${target//-/_}
 echo "export BORING_BSSL_PATH_$t='$dir'"
 echo "export BORING_BSSL_INCLUDE_PATH_$t='$dir/include'"
