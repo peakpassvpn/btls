@@ -79,6 +79,11 @@ They are the target's own (`BORING_BSSL_PATH_<target>`,
 so a build that also compiles for its host is not handed them there.
 bindgen still runs over `include/`, so the build needs libclang as before.
 
+The script needs `gh`, signed in, for the attestation; without it, or if a
+check fails, it exits with an error and prints nothing, and the cache keeps
+nothing of that download. A build that then runs without the variables
+compiles BoringSSL from source as before.
+
 **What the consumer's build must match** (each is what sail builds with):
 
 - **Windows (MSVC):** the dynamic CRT, `/MD`, Rust's default. A build
