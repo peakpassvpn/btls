@@ -735,11 +735,18 @@ fn install_artifacts(
     let lib_dir = install_dir.join("lib");
     fs::create_dir(&lib_dir)?;
 
-    for lib in ["libcrypto.a", "libssl.a", "bcm.o"] {
-        if !config.features.fips && lib == "bcm.o" {
-            continue;
-        }
-        fs::copy(bssl_build_dir.join(lib), lib_dir.join(lib))?;
+    // Where and as what cmake left them: `libcrypto.a` at the build's top,
+    // or `crypto.lib` in a configuration's folder with MSVC's generator.
+    // They go into `lib` under their own names, which is where a
+    // precompiled `BORING_BSSL_PATH` is looked in.
+    let msvc_subdir = msvc_lib_subdir(config);
+    for library in ["crypto", "ssl"] {
+        let archive = find_archive(bssl_build_dir, &config.target_env, msvc_subdir, library)?;
+        let name = archive.file_name().ok_or("an archive without a name")?;
+        fs::copy(&archive, lib_dir.join(name))?;
+    }
+    if config.features.fips {
+        fs::copy(bssl_build_dir.join("bcm.o"), lib_dir.join("bcm.o"))?;
     }
 
     fs_extra::dir::copy(get_include_path(config)?, &install_dir, &Default::default())?;
