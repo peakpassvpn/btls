@@ -31,10 +31,12 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   # Built from this commit's btls and btls-sys rather than those sail
-  # pins: both, as btls's own btls-sys is the one beside it, and only one
-  # package may link the library.
-  PATCH_SYS: patch."https://github.com/peakpassvpn/btls.git".btls-sys.path="../btls/btls-sys"
-  PATCH_BTLS: patch."https://github.com/peakpassvpn/btls.git".btls.path="../btls/btls"
+  # pins, which its manifest patches in for crates.io's: a patch given as
+  # configuration takes precedence over the manifest's. Both, as btls's
+  # own btls-sys is the one beside it, and only one package may link the
+  # library.
+  PATCH_SYS: patch.crates-io.btls-sys.path="../btls/btls-sys"
+  PATCH_BTLS: patch.crates-io.btls.path="../btls/btls"
 
 jobs:
   build:
