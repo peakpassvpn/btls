@@ -438,6 +438,7 @@ jobs:
           0011-boringssl-prefix-struct-tags.patch \
           0012-boringssl-seal-app-data.patch \
           0013-boringssl-cheap-error-reset.patch \
+          boringssl-rand-double-free.patch \
           boringssl-loongarch.patch \
           underscore-wildcards.patch \
           relax-cert-validation.patch; do
@@ -455,6 +456,12 @@ jobs:
     - name: Build BoringSSL
       working-directory: btls-sys/deps/boringssl
       run: cmake --build build --parallel
+    - name: Test RAND thread-local failure fallback under ASan
+      working-directory: btls-sys/deps/boringssl
+      run: |
+        clang -fsanitize=address -Iinclude ../../tests/rand_thread_local_failure.c \
+          build/libcrypto.a -lstdc++ -lpthread -o build/rand_thread_local_failure
+        build/rand_thread_local_failure
     - name: Run BoringSSL C/C++ test suite
       working-directory: btls-sys/deps/boringssl
       run: go run util/all_tests.go
