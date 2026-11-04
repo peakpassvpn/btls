@@ -40,7 +40,6 @@
 use crate::ffi;
 use libc::c_int;
 use openssl_macros::corresponds;
-use std::mem::MaybeUninit;
 use std::ptr;
 
 /// Provides Error handling for parsing keys.
@@ -51,6 +50,15 @@ pub struct KeyError(());
 pub struct AesKey(ffi::AES_KEY);
 
 impl AesKey {
+    // AES-128 and AES-192 fill only part of rd_key. All integer fields must be
+    // initialized before the key schedule can be held as a Rust AES_KEY.
+    fn zeroed() -> Self {
+        AesKey(ffi::AES_KEY {
+            rd_key: [0; 60],
+            rounds: 0,
+        })
+    }
+
     /// Prepares a key for encryption.
     ///
     /// # Failure
@@ -61,14 +69,14 @@ impl AesKey {
         unsafe {
             assert!(key.len() <= c_int::MAX as usize / 8);
 
-            let mut aes_key = MaybeUninit::uninit();
+            let mut aes_key = AesKey::zeroed();
             let r = ffi::AES_set_encrypt_key(
                 key.as_ptr(),
                 (key.len() * 8).try_into().map_err(|_| KeyError(()))?,
-                aes_key.as_mut_ptr(),
+                &mut aes_key.0,
             );
             if r == 0 {
-                Ok(AesKey(aes_key.assume_init()))
+                Ok(aes_key)
             } else {
                 Err(KeyError(()))
             }
@@ -85,15 +93,15 @@ impl AesKey {
         unsafe {
             assert!(key.len() <= c_int::MAX as usize / 8);
 
-            let mut aes_key = MaybeUninit::uninit();
+            let mut aes_key = AesKey::zeroed();
             let r = ffi::AES_set_decrypt_key(
                 key.as_ptr(),
                 (key.len() * 8).try_into().map_err(|_| KeyError(()))?,
-                aes_key.as_mut_ptr(),
+                &mut aes_key.0,
             );
 
             if r == 0 {
-                Ok(AesKey(aes_key.assume_init()))
+                Ok(aes_key)
             } else {
                 Err(KeyError(()))
             }
@@ -184,28 +192,50 @@ mod test {
 
     use super::*;
 
-    // from the RFC https://tools.ietf.org/html/rfc3394#section-2.2.3
+    // RFC 3394 sections 4.1-4.3: the same plaintext with each supported key size.
     #[test]
     fn test_wrap_unwrap() {
-        let raw_key = Vec::from_hex("000102030405060708090A0B0C0D0E0F").unwrap();
         let key_data = Vec::from_hex("00112233445566778899AABBCCDDEEFF").unwrap();
-        let expected_ciphertext =
-            Vec::from_hex("1FA68B0A8112B447AEF34BD8FB5A7B829D3E862371D2CFE5").unwrap();
+        for (raw_key, expected_ciphertext) in [
+            (
+                "000102030405060708090A0B0C0D0E0F",
+                "1FA68B0A8112B447AEF34BD8FB5A7B829D3E862371D2CFE5",
+            ),
+            (
+                "000102030405060708090A0B0C0D0E0F1011121314151617",
+                "96778B25AE6CA435F92B5B97C050AED2468AB8A17AD84E5D",
+            ),
+            (
+                "000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F",
+                "64E8C3F9CE0F5BA263E9777905818A2A93C8191E7D6E8AE7",
+            ),
+        ] {
+            let raw_key = Vec::from_hex(raw_key).unwrap();
+            let expected_ciphertext = Vec::from_hex(expected_ciphertext).unwrap();
+            let enc_key = AesKey::new_encrypt(&raw_key).unwrap();
+            let mut wrapped = [0; 24];
+            assert_eq!(
+                wrap_key(&enc_key, None, &mut wrapped, &key_data).unwrap(),
+                24
+            );
+            assert_eq!(&wrapped[..], &expected_ciphertext[..]);
 
-        let enc_key = AesKey::new_encrypt(&raw_key).unwrap();
-        let mut wrapped = [0; 24];
-        assert_eq!(
-            wrap_key(&enc_key, None, &mut wrapped, &key_data).unwrap(),
-            24
-        );
-        assert_eq!(&wrapped[..], &expected_ciphertext[..]);
+            let dec_key = AesKey::new_decrypt(&raw_key).unwrap();
+            let mut unwrapped = [0; 16];
+            assert_eq!(
+                unwrap_key(&dec_key, None, &mut unwrapped, &wrapped).unwrap(),
+                16
+            );
+            assert_eq!(&unwrapped[..], &key_data[..]);
+        }
+    }
 
-        let dec_key = AesKey::new_decrypt(&raw_key).unwrap();
-        let mut unwrapped = [0; 16];
-        assert_eq!(
-            unwrap_key(&dec_key, None, &mut unwrapped, &wrapped).unwrap(),
-            16
-        );
-        assert_eq!(&unwrapped[..], &key_data[..]);
+    #[test]
+    fn test_invalid_key_lengths() {
+        for len in [0, 15, 17, 23, 25, 31, 33] {
+            let raw_key = vec![0; len];
+            assert!(AesKey::new_encrypt(&raw_key).is_err());
+            assert!(AesKey::new_decrypt(&raw_key).is_err());
+        }
     }
 }
