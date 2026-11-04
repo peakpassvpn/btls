@@ -1,6 +1,8 @@
 // Force BoringSSL's RAND thread-local setup to fail. RAND_bytes must use
 // its stack fallback without freeing the thread state a second time.
-// Run as a separate executable: this symbol intentionally overrides pthreads.
+// GNU ld wraps calls from the static library only, leaving sanitizer/runtime
+// thread-local storage alone. On macOS, two-level namespace binding keeps the
+// executable override separate from the runtime shared libraries.
 #include <openssl/rand.h>
 #include <errno.h>
 #include <pthread.h>
@@ -8,7 +10,11 @@
 
 static unsigned setup_failures;
 
+#ifdef __APPLE__
 int pthread_setspecific(pthread_key_t key, const void *value) {
+#else
+int __wrap_pthread_setspecific(pthread_key_t key, const void *value) {
+#endif
   (void)key;
   (void)value;
   ++setup_failures;

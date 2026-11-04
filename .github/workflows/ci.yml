@@ -460,7 +460,8 @@ jobs:
       working-directory: btls-sys/deps/boringssl
       run: |
         clang -fsanitize=address -Iinclude ../../tests/rand_thread_local_failure.c \
-          build/libcrypto.a -lstdc++ -lpthread -o build/rand_thread_local_failure
+          build/libcrypto.a -Wl,--wrap=pthread_setspecific -lstdc++ -lpthread \
+          -o build/rand_thread_local_failure
         build/rand_thread_local_failure
     - name: Run BoringSSL C/C++ test suite
       working-directory: btls-sys/deps/boringssl
