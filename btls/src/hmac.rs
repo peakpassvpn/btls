@@ -1,7 +1,7 @@
-use crate::cvt;
 use crate::error::ErrorStack;
 use crate::foreign_types::ForeignTypeRef;
 use crate::hash::MessageDigest;
+use crate::{cvt, cvt_p};
 use openssl_macros::corresponds;
 
 foreign_type_and_impl_send_sync! {
@@ -39,20 +39,21 @@ impl Hmac {
     pub fn init(key: &[u8], md: &MessageDigest) -> Result<Hmac, ErrorStack> {
         ffi::init();
 
-        let ctx = unsafe {
-            let ctx = ffi::HMAC_CTX_new();
+        let ctx = unsafe { cvt_p(ffi::HMAC_CTX_new())? };
+        // Own the allocation before initialization, which can also fail.
+        let hmac = Hmac(ctx);
+        unsafe {
             cvt(ffi::HMAC_Init_ex(
-                ctx,
+                hmac.0,
                 key.as_ptr().cast(),
                 key.len(),
                 md.as_ptr(),
                 // ENGINE api is deprecated
                 core::ptr::null_mut(),
             ))?;
-            ctx
-        };
+        }
 
-        Ok(Hmac(ctx))
+        Ok(hmac)
     }
 
     /// Updates the HMAC input.
@@ -87,6 +88,20 @@ mod tests {
     use crate::hash;
 
     use super::*;
+
+    #[test]
+    fn allocation_failure_does_not_initialize_null_context() {
+        let _failure = ffi::FailureGuard::new(ffi::Failure::Allocation);
+        assert!(Hmac::init(b"key", &MessageDigest::sha256()).is_err());
+        assert_eq!(ffi::call_counts(), [1, 0, 0]);
+    }
+
+    #[test]
+    fn initialization_failure_frees_context() {
+        let _failure = ffi::FailureGuard::new(ffi::Failure::Initialization);
+        assert!(Hmac::init(b"key", &MessageDigest::sha256()).is_err());
+        assert_eq!(ffi::call_counts(), [1, 1, 1]);
+    }
 
     fn test<const N: usize>(md: MessageDigest) {
         assert_eq!(N, md.size());
@@ -126,5 +141,118 @@ mod tests {
     #[test]
     fn test_sha512() {
         test::<64>(MessageDigest::sha512());
+    }
+}
+
+// Only unit tests intercept these three calls; release builds use crate::ffi.
+// Failures are thread-local so other crypto tests still use the native functions.
+#[cfg(test)]
+#[allow(non_snake_case)]
+mod ffi {
+    pub(super) use crate::ffi::*;
+    use std::cell::Cell;
+    use std::ffi::{c_int, c_void};
+    use std::ptr;
+
+    #[derive(Clone, Copy, PartialEq)]
+    pub(super) enum Failure {
+        Allocation,
+        Initialization,
+    }
+
+    #[derive(Clone, Copy)]
+    struct State {
+        failure: Option<Failure>,
+        calls: [usize; 3],
+        allocation: *mut HMAC_CTX,
+    }
+
+    thread_local! {
+        static STATE: Cell<State> = const { Cell::new(State {
+            failure: None,
+            calls: [0; 3],
+            allocation: ptr::null_mut(),
+        }) };
+    }
+
+    pub(super) struct FailureGuard(State);
+
+    impl FailureGuard {
+        pub(super) fn new(failure: Failure) -> Self {
+            STATE.with(|state| {
+                let previous = state.get();
+                assert!(previous.failure.is_none());
+                state.set(State {
+                    failure: Some(failure),
+                    calls: [0; 3],
+                    allocation: ptr::null_mut(),
+                });
+                Self(previous)
+            })
+        }
+    }
+
+    impl Drop for FailureGuard {
+        fn drop(&mut self) {
+            let state = STATE.with(|state| state.replace(self.0));
+            // Clean up even when a regressed implementation leaks and the test
+            // assertion panics. This does not contribute to the call counts.
+            if !state.allocation.is_null() {
+                unsafe { crate::ffi::HMAC_CTX_free(state.allocation) };
+            }
+        }
+    }
+
+    pub(super) fn call_counts() -> [usize; 3] {
+        STATE.with(|state| state.get().calls)
+    }
+
+    pub(super) unsafe fn HMAC_CTX_new() -> *mut HMAC_CTX {
+        STATE.with(|state| {
+            let mut current = state.get();
+            if current.failure.is_none() {
+                return unsafe { crate::ffi::HMAC_CTX_new() };
+            }
+            current.calls[0] += 1;
+            if current.failure != Some(Failure::Allocation) {
+                current.allocation = unsafe { crate::ffi::HMAC_CTX_new() };
+                assert!(!current.allocation.is_null());
+            }
+            state.set(current);
+            current.allocation
+        })
+    }
+
+    pub(super) unsafe fn HMAC_Init_ex(
+        ctx: *mut HMAC_CTX,
+        key: *const c_void,
+        key_len: usize,
+        md: *const EVP_MD,
+        engine: *mut ENGINE,
+    ) -> c_int {
+        STATE.with(|state| {
+            let mut current = state.get();
+            if current.failure.is_none() {
+                return unsafe { crate::ffi::HMAC_Init_ex(ctx, key, key_len, md, engine) };
+            }
+            current.calls[1] += 1;
+            state.set(current);
+            // If a regression passes a null allocation here, report the extra
+            // call through the assertions instead of dereferencing null in C.
+            0
+        })
+    }
+
+    pub(super) unsafe fn HMAC_CTX_free(ctx: *mut HMAC_CTX) {
+        STATE.with(|state| {
+            let mut current = state.get();
+            if current.failure.is_some() {
+                current.calls[2] += 1;
+                assert_eq!(ctx, current.allocation);
+                current.allocation = ptr::null_mut();
+                state.set(current);
+            }
+        });
+        unsafe { crate::ffi::HMAC_CTX_free(ctx) };
     }
 }
