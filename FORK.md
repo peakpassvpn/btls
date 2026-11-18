@@ -4,7 +4,7 @@ sail's fork of [0x676e67/btls](https://github.com/0x676e67/btls). The
 `sail` branch tracks upstream `main`, and sail pins revisions of it.
 
 Upstream is merged into `sail`, never rebased onto it, and the branch is
-never force-pushed: a pinned revision has to stay reachable. The patches
+never force-pushed: a pinned revision has to stay reachable. The fork-specific patches
 below are not offered upstream.
 
 ## Patches
@@ -32,6 +32,19 @@ below are not offered upstream.
   payload length of the ECH GREASE extension, which BoringSSL picks by AES
   hardware and at random. Imitating Firefox needs ChaCha20-Poly1305 and a
   240-byte payload.
+
+## Safety backports
+
+- The BoringSSL RAND thread-local failure cleanup fix is applied to both
+  normal and FIPS source builds, from upstream btls commit
+  [`afe306ce`](https://github.com/0x676e67/btls/commit/afe306ce5759c7311fd78067d5ca273ed5ec064c).
+  The ASan CI job exercises the stack fallback when thread-local setup fails.
+- AES key schedules are fully initialized before Rust owns them, and HMAC
+  construction checks allocation and owns the context before fallible setup.
+  These targeted fixes come from upstream btls commit
+  [`ddf2c9ea`](https://github.com/0x676e67/btls/commit/ddf2c9ea12106be5b4f61cbbbc5d21898e992631),
+  without taking its unrelated API additions. They can be dropped when a
+  later upstream merge includes the equivalent changes.
 
 ## When it could go away
 
